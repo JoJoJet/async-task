@@ -5,7 +5,7 @@ use core::mem;
 use core::pin::Pin;
 use core::ptr::NonNull;
 use core::sync::atomic::Ordering;
-use core::task::{Context, Poll};
+use core::task::{Context, Poll, Waker};
 
 use crate::header::Header;
 use crate::raw::Panic;
@@ -177,6 +177,88 @@ impl<T, M> Task<T, M> {
     /// ```
     pub fn fallible(self) -> FallibleTask<T, M> {
         FallibleTask { task: self }
+    }
+
+    /// Attempts to take the output of this [`Task`] if it is complete.
+    /// This can be used to periodically check a task for completion within
+    /// synchronous code. For games, you could call this method once per frame
+    /// until the task is complete.
+    ///
+    /// Returns `None` if it is not complete, or if the task has already been closed.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use smol::Executor;
+    ///
+    /// # let global_executor = Executor::new();
+    /// // Make an IO request that will take a while.
+    /// // Store it to be periodically checked later.
+    /// let task = global_executor.spawn(make_network_request("rust-lang.org"));
+    /// # // Spawn an executor thread.
+    /// # use smol::future;
+    /// # std::thread::spawn(move || future::block_on(global_executor.tick()));
+    ///
+    /// // ...
+    ///
+    /// // Later, within an application loop, such as one that gets called once per frame:
+    /// # let mut task = task; for _ in 0..1000u128 {
+    /// if let Some(val) = task.try_take() {
+    ///     println!("Got {val} from the server.");
+    ///     # assert_eq!(val, 1); return;
+    /// } else {
+    ///     // Try again next frame.
+    /// }
+    /// # }
+    /// # panic!("Test timed out");
+    ///
+    /// # use smol::Timer; use std::time::Duration;
+    /// # async fn make_network_request(url: &str) -> u32 { Timer::after(Duration::from_millis(10)).await; 1 }
+    /// ```
+    pub fn try_take(&mut self) -> Option<T> {
+        let ptr = self.ptr.as_ptr();
+        let header = ptr as *const Header<M>;
+
+        unsafe {
+            let state = (*header).state.load(Ordering::Acquire);
+
+            eprintln!("{state}");
+
+            if state & COMPLETED == 0 || state & CLOSED != 0 {
+                return None;
+            }
+
+            // If the current state is completed but not closed,
+            // mark the new state as completed and closed.
+            match (*header).state.compare_exchange(
+                state,
+                state | CLOSED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                // Since the task is complete, we can take and return the value.
+                Ok(_) => {
+                    // Take the output from the task.
+                    let output = ((*header).vtable.get_output)(ptr) as *mut Result<T, Panic>;
+                    let output = output.read();
+
+                    // Propagate the panic if the task panicked.
+                    let output = match output {
+                        Ok(output) => output,
+                        Err(panic) => {
+                            #[cfg(feature = "std")]
+                            std::panic::resume_unwind(panic);
+
+                            #[cfg(not(feature = "std"))]
+                            match panic {}
+                        }
+                    };
+
+                    Some(output)
+                }
+                Err(_) => None,
+            }
+        }
     }
 
     /// Puts the task in canceled state.
